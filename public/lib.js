@@ -79,57 +79,10 @@ export const GENRES = ['מזרחית', 'פופ ישראלי', 'רוק ישראל
 
 export const AGES = { young: 'צעירים ברובם', mixed: 'מעורב', older: 'מבוגרים ברובם' };
 
-/* ---------- packing data into a link ---------- */
+// The type's settings, falling back to "other" while the client hasn't picked one yet.
+export const typeOf = d => TYPES[d && d.type] || TYPES.other;
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-// Last character of every packed value. If a chat app cuts the link short, the marker is gone and we can say so.
-const END = 'E';
-
-export function toB64url(bytes) {
-  let bin = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-export function fromB64url(s) {
-  if (!/^[A-Za-z0-9_-]*$/.test(s)) throw new Error('bad link');
-  const b = s.replace(/-/g, '+').replace(/_/g, '/');
-  const bin = atob(b + '==='.slice((b.length + 3) % 4));
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-async function through(bytes, stream) {
-  const out = new Blob([bytes]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(out).arrayBuffer());
-}
-
-export async function pack(obj) {
-  const bytes = enc.encode(JSON.stringify(obj));
-  try {
-    return 'z' + toB64url(await through(bytes, new CompressionStream('deflate-raw'))) + END;
-  } catch {
-    return 'j' + toB64url(bytes) + END;
-  }
-}
-
-export class CutLinkError extends Error {}
-
-export async function unpack(str) {
-  str = String(str || '').trim();
-  if (!str.endsWith(END)) throw new CutLinkError('link cut short');
-  const kind = str[0];
-  const body = fromB64url(str.slice(1, -1));
-  let bytes;
-  if (kind === 'z') bytes = await through(body, new DecompressionStream('deflate-raw'));
-  else if (kind === 'j') bytes = body;
-  else throw new Error('bad link');
-  return JSON.parse(dec.decode(bytes));
-}
-
-/* ---------- cleaning data that arrives from a link ---------- */
+/* ---------- cleaning data that arrives from outside ---------- */
 
 export function str(v, max) {
   if (typeof v === 'number' && Number.isFinite(v)) v = String(v);
@@ -150,7 +103,7 @@ export function cleanDj(v) {
 }
 
 export function cleanId(v) {
-  return typeof v === 'string' && /^[a-z0-9]{4,16}$/.test(v) ? v : '';
+  return typeof v === 'string' && /^[a-z0-9]{8,24}$/.test(v) ? v : '';
 }
 
 export function cleanBrief(raw) {
@@ -158,7 +111,8 @@ export function cleanBrief(raw) {
   const songs = v => list(v, 100).map(cleanSong).filter(Boolean);
   return {
     names: str(r.names, 120),
-    type: TYPES[r.type] ? r.type : 'other',
+    // '' means the client hasn't chosen yet
+    type: r.type === '' ? '' : TYPES[r.type] ? r.type : 'other',
     date: typeof r.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.date) ? r.date : '',
     start: time(r.start),
     end: time(r.end),
@@ -197,9 +151,10 @@ export function defaultsFor(type) {
   };
 }
 
+// A fresh, empty brief. Without a type it starts unchosen, with the general defaults.
 export function newBrief(ev) {
   const e = ev && typeof ev === 'object' ? ev : {};
-  const type = TYPES[e.type] ? e.type : 'other';
+  const type = TYPES[e.type] ? e.type : '';
   return cleanBrief({ ...e, type, ...defaultsFor(type) });
 }
 
@@ -294,8 +249,70 @@ export function okUrl(u) {
   }
 }
 
+// Event ids are also the client's access to their form, so they must be hard to guess (about 100 bits).
 export function uid() {
-  const a = new Uint32Array(2);
+  const a = new Uint8Array(20);
   crypto.getRandomValues(a);
-  return (a[0].toString(36) + a[1].toString(36)).slice(0, 12).padEnd(6, '0');
+  const abc = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return Array.from(a, b => abc[b % 36]).join('');
+}
+
+// One line summing up an event: "יום הולדת · דנה, 40 · יום ו׳, 20 בפבר׳"
+export function eventLine(d, label = '') {
+  return [d.type ? typeOf(d).label : '', d.names || label, fmtDate(d.date, true)].filter(Boolean).join(' · ');
+}
+
+/* ---------- calendar file (.ics) ---------- */
+
+const icsEscape = s => String(s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+
+// Lines longer than 75 bytes must be folded, without cutting a Hebrew letter (2 bytes in UTF-8) in half.
+function icsFold(line) {
+  const out = [];
+  let cur = '', bytes = 0, limit = 75;
+  for (const ch of line) {
+    const n = new TextEncoder().encode(ch).length;
+    if (bytes + n > limit) { out.push(cur); cur = ' '; bytes = 1; limit = 75; }
+    cur += ch;
+    bytes += n;
+  }
+  out.push(cur);
+  return out.join('\r\n');
+}
+
+const compact = s => s.replace(/[-:]/g, '');
+function addDay(iso) {
+  const d = new Date(iso + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+// Builds a calendar file for one event. Times are Israel time; an end time earlier than the start is the next day.
+export function buildIcs(d, { uid: id, url = '', dj = '', stamp = new Date() } = {}) {
+  if (!d.date) return '';
+  const title = [dj, d.type ? typeOf(d).label : '', d.names].filter(Boolean).join(' · ');
+  const tl = sortTimeline(d.timeline.filter(r => r.time || r.what)).map(r => `${r.time} ${r.what}`.trim());
+  const desc = [
+    d.contactName || d.contactPhone ? `איש קשר: ${[d.contactName, d.contactPhone].filter(Boolean).join(' ')}` : '',
+    d.guests ? `אורחים: ${d.guests}` : '',
+    tl.length ? `לו״ז:\n${tl.join('\n')}` : '',
+    url ? `כל הפרטים: ${url}` : '',
+  ].filter(Boolean).join('\n\n');
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//DJ MB//events//HE', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'BEGIN:VEVENT',
+    `UID:${id}@dj-mb`, `DTSTAMP:${stamp.toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '')}`];
+  if (d.start) {
+    lines.push(`DTSTART;TZID=Asia/Jerusalem:${compact(d.date)}T${compact(d.start)}00`);
+    const end = d.end || d.start;
+    const endDate = d.end && d.end < d.start ? addDay(d.date) : d.date;
+    if (d.end) lines.push(`DTEND;TZID=Asia/Jerusalem:${compact(endDate)}T${compact(end)}00`);
+  } else {
+    lines.push(`DTSTART;VALUE=DATE:${compact(d.date)}`, `DTEND;VALUE=DATE:${compact(addDay(d.date))}`);
+  }
+  lines.push(`SUMMARY:${icsEscape(title || 'אירוע')}`);
+  const place = [d.venue, d.city].filter(Boolean).join(', ');
+  if (place) lines.push(`LOCATION:${icsEscape(place)}`);
+  if (desc) lines.push(`DESCRIPTION:${icsEscape(desc)}`);
+  if (url) lines.push(`URL:${url}`);
+  lines.push('BEGIN:VALARM', 'ACTION:DISPLAY', 'DESCRIPTION:מחר יש אירוע', 'TRIGGER:-P1D', 'END:VALARM', 'END:VEVENT', 'END:VCALENDAR');
+  return lines.map(icsFold).join('\r\n') + '\r\n';
 }

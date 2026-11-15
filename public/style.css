@@ -80,6 +80,9 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .75; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--accent); }
 .btn.danger { color: var(--bad); }
 .btn.block { display: flex; width: 100%; }
+.btn.big { min-height: 56px; font-size: 18px; }
+.notice { border-color: var(--accent); background: var(--accent-soft); margin-top: 6px; }
+.notice h3 { color: var(--accent); }
 .btn.small { min-height: 38px; padding: 6px 12px; font-size: 15px; border-radius: 10px; }
 .btn[aria-disabled=true] { opacity: .5; pointer-events: none; }
 .iconbtn { width: 44px; height: 44px; flex: none; display: inline-grid; place-items: center; border-radius: 12px;

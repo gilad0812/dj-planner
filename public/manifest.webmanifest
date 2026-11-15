@@ -1,0 +1,18 @@
+{
+  "id": "/",
+  "name": "DJ MB",
+  "short_name": "DJ MB",
+  "description": "האירועים של DJ MB",
+  "lang": "he",
+  "dir": "rtl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#FBF8F3",
+  "theme_color": "#0E6E6C",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

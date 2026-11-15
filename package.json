@@ -2,5 +2,12 @@
   "name": "dj-planner",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node --test test/lib.test.mjs" }
+  "scripts": {
+    "test": "node --test test/lib.test.mjs test/push.test.mjs",
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.162.0"
+  }
 }

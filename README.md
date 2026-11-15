@@ -1,42 +1,39 @@
-# DJ MB event planner
+# DJ MB
 
-A small Hebrew web app for DJ MB. She sends each client a link, the client fills in the event details on their phone, and the filled-in details come back to her on WhatsApp as a run sheet for the event.
+A small Hebrew app for DJ MB, an event DJ. She sends a client a link; the client fills in the event details, songs and timeline on their phone and confirms; she gets a phone notification, sees the event in her app, and can add it to her iPhone calendar with one tap.
 
-It covers any kind of event: wedding, henna, engagement, bar and bat mitzvah, brit, birthday, bachelor/bachelorette party, school party, company event, private party, or anything else. Each type comes with its own key moments (for example candle lighting for a bar mitzvah, cake for a birthday, speeches for a company event) and a typical timeline, which the client can change.
+It covers any kind of event: wedding, henna, engagement, bar and bat mitzvah, brit, birthday, bachelor/bachelorette party, school party, company event, private party, or other. Each type has its own key moments and typical timeline, which the client can change.
 
-There is no server and no database. Every event's details travel inside the link (compressed after the `#`, so even the web host never sees them), and the DJ's events are saved in the browser on her phone.
+Setting it up (accounts, deploy, installing on her phone): see [SETUP.md](SETUP.md).
 
 ## How it works
 
-1. **First time**: the DJ opens the site, checks her stage name (filled in as DJ MB) and enters her WhatsApp number.
-2. **New event**: she picks the type of event, enters whose event it is, the date and venue, then taps "שליחה בוואטסאפ" to send the client a link.
-3. **The client** fills in a 6-step form: details, music style, key moments (with song search), must-play / maybe / do-not-play songs, timeline and notes. Their progress is saved on their phone as they go.
-4. **The client taps send**: WhatsApp opens to the DJ's chat with a message holding a link to the filled-in details.
-5. **The DJ opens that link** on her phone: the event is saved in her list, with a run sheet she can print, Waze navigation, a call button for the contact person on the day, and YouTube search links for every song.
+- **Her app** (`/`): installed on her iPhone home screen. "קישור חדש ללקוח" creates an event and opens WhatsApp or the share sheet with the link. The list shows upcoming events, links still waiting to be filled in, and past events. Each event has the full run sheet, print, Waze, a call button for the contact on the day, and "הוספה ליומן".
+- **The client's form** (`/?e=<id>`): 6 steps (details, music style, key moments with song search, songs, timeline, confirm). Progress is saved on the client's phone; confirming sends it to the server. They can reopen the same link later, change things and confirm again.
+- **Notifications**: when a client confirms, the server sends a Web Push notification ("אירוע חדש" or "עדכון באירוע") to her phone. Tapping it opens that event.
+- **Calendar**: "הוספה ליומן" downloads an `.ics` file that iPhone offers to add to the calendar, with a reminder a day before.
 
-If the client changes something later, they send again and the newer version replaces the old one. The DJ can also send an "update link" that opens the form already filled in.
+## Pieces
 
-## Files
+- `public/`: the app (no build step). `lib.js` holds the pure logic (event types, data cleaning, Hebrew dates, calendar files); `app.js` the screens; `sw.js` shows notifications.
+- `worker/`: a Cloudflare Worker. `index.js` is the API and serves `public/`; `push.js` is Web Push (RFC 8291 encryption and VAPID) using only Web Crypto.
+- `migrations/`: the D1 (SQLite) tables: `events` and `subs` (phones that get notifications).
+- Access: the event id in the client's link (20 random characters) is the client's only key, and only lets them read and update that one event. Her app uses a secret connection code (`ADMIN_KEY`).
+- Song search uses Apple's free iTunes search API.
 
-- `index.html`, `style.css`, `app.js`: the app (no build step)
-- `lib.js`: pure logic: packing data into links, cleaning data from links, defaults per event type, Hebrew dates
-- `test/lib.test.mjs`: tests for `lib.js`, run with `npm test` (Node 18+)
-
-## Run it locally
+## Develop
 
 ```bash
-python -m http.server 8765
+npm install
+node scripts/make-keys.mjs
+npx wrangler d1 migrations apply dj-mb --local
+npm run dev
 ```
 
-Then open http://localhost:8765. It must be served over http, not opened as a file.
+Then open http://localhost:8787 and paste `ADMIN_KEY` from `.dev.vars` as the connection code. Client links are `http://localhost:8787/?e=<id>`.
 
-## Put it online (free)
+```bash
+npm test
+```
 
-Any static host works. With GitHub Pages: push these files to a GitHub repo, then in the repo's Settings → Pages, choose "Deploy from a branch", `main`, `/ (root)`. The site will be at `https://<username>.github.io/<repo>/`.
-
-## Good to know
-
-- **Add it to the home screen** on the DJ's phone (Safari: Share → Add to Home Screen). Safari can clear website data for sites that aren't used for a while, and home-screen apps are protected from that.
-- **Backups**: Settings → "הורדת גיבוי" saves a file with all events. Even without a backup, every event can be recovered by opening the link the client sent on WhatsApp again.
-- Song search uses Apple's free iTunes search, so it needs an internet connection. Clients can always type a song name instead.
-- Links are long (around 1,000 characters for a filled-in event). That's fine for WhatsApp. If a link gets cut off when copied somewhere else, the app says so instead of showing broken data.
+Tests cover the logic, the calendar file, and push encryption (checked against a separately written decryption) and VAPID signatures.

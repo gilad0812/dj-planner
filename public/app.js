@@ -1,11 +1,10 @@
 import {
-  TYPES, TYPE_KEYS, GENRES, AGES, pack, unpack, CutLinkError, cleanBrief, cleanDj, cleanId, cleanSong, str,
-  newBrief, defaultsFor, isDefaultList, sortTimeline, daysUntil, whenLabel, fmtDate, hebDate, waPhone, okUrl, uid,
+  TYPES, TYPE_KEYS, GENRES, AGES, cleanBrief, cleanId, cleanSong, typeOf, newBrief, defaultsFor, isDefaultList,
+  sortTimeline, daysUntil, whenLabel, fmtDate, hebDate, waPhone, okUrl,
 } from './lib.js';
 
 const app = document.getElementById('app');
-const BASE = location.origin + location.pathname;
-const BRAND = 'DJ MB'; // default stage name, editable in settings
+let CONFIG = { dj: 'DJ MB', vapid: '' };
 
 /* ================= small helpers ================= */
 
@@ -16,7 +15,7 @@ const store = {
   del(k) { try { localStorage.removeItem('djp:' + k); } catch { /* ignore */ } },
 };
 
-// Builds DOM nodes. Text always goes in as text, never as HTML, so data from links can't inject markup.
+// Builds DOM nodes. Text always goes in as text, never as HTML, so client data can't inject markup.
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
   let value;
@@ -46,16 +45,13 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
 function field(label, control, hint) {
   return h('label', { class: 'field' }, h('span', { class: 'lbl' }, label), control, hint ? h('span', { class: 'hint' }, hint) : null);
 }
-
-function topBar(start, end) {
-  return h('header', { class: 'top' }, start, end || null);
-}
+const topBar = (start, end) => h('header', { class: 'top' }, start, end || null);
 const brand = title => h('div', { class: 'brand' }, disc(), h('span', null, title));
 const backBtn = onBack => h('button', { class: 'btn ghost small noprint', onclick: onBack }, '→ חזרה');
 
@@ -77,308 +73,323 @@ const waLink = (phone, text) => `https://wa.me/${waPhone(phone)}?text=${encodeUR
 const withL = name => (/^[֐-׿]/.test(name) ? 'ל' : 'ל-') + name;
 const monthShort = iso => new Intl.DateTimeFormat('he-IL', { month: 'short' }).format(new Date(iso + 'T12:00:00'));
 const fmtStamp = ts => new Intl.DateTimeFormat('he-IL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(ts);
-const evOf = d => ({ names: d.names, type: d.type, date: d.date, venue: d.venue });
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 
-/* ================= routing ================= */
-// #c=...  a client's form link (made by the DJ)
-// #b=...  a filled brief coming back to the DJ
-// nothing  the DJ's own screens
+function unb64u(s) {
+  const b = s.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(b + '==='.slice((b.length + 3) % 4)), c => c.charCodeAt(0));
+}
 
-let routeSeq = 0;
-async function route() {
-  const my = ++routeSeq;
-  C = null;
-  const m = /^#([cb])=(.+)$/.exec(location.hash);
-  if (!m) return djHome();
+/* ================= talking to the server ================= */
+
+class ApiError extends Error {
+  constructor(status, msg) { super(msg); this.status = status; }
+}
+
+async function api(path, { method = 'GET', body, admin = false } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  if (admin) headers.authorization = 'Bearer ' + (store.get('key') || '');
+  let res;
   try {
-    const payload = await unpack(decodeURIComponent(m[2]));
-    if (my !== routeSeq) return;
-    if (m[1] === 'c') clientStart(payload);
-    else briefFromLink(payload);
-  } catch (e) {
-    if (my === routeSeq) broken(e instanceof CutLinkError);
+    res = await fetch('/api' + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store' });
+  } catch {
+    throw new ApiError(0, 'offline');
   }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, data.error || 'error');
+  return data;
 }
 
-function goHome() {
-  history.replaceState(null, '', BASE);
-  C = null;
-  djHome();
+function messageScreen(title, text, action) {
+  screen(topBar(brand(CONFIG.dj)), h('div', { class: 'hero' }, h('h1', null, title), h('p', null, text)), action || null);
 }
 
-function broken(cut) {
-  document.title = 'פרטי האירוע';
-  screen(
-    topBar(brand('פרטי האירוע')),
-    h('div', { class: 'hero' },
-      h('h1', null, cut ? 'הקישור נחתך' : 'הקישור לא תקין'),
-      h('p', null, cut
-        ? 'נראה שהקישור לא הועתק עד הסוף. כדאי לפתוח אותו ישירות מההודעה בוואטסאפ, או לבקש שישלחו אותו שוב.'
-        : 'אי אפשר לפתוח את הקישור הזה. אפשר לבקש שישלחו אותו שוב.')),
-  );
+/* ================= start ================= */
+
+async function start() {
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // A setup link (…#k=CODE) connects this phone as the DJ's.
+  const k = /[#&]k=([A-Za-z0-9]{16,64})/.exec(location.hash);
+  if (k) { store.set('key', k[1]); history.replaceState(null, '', location.pathname + location.search); }
+  try { CONFIG = { ...CONFIG, ...(await api('/config')) }; } catch { /* use the defaults */ }
+  const q = new URLSearchParams(location.search);
+  const e = cleanId(q.get('e') || '');
+  if (q.has('e')) return e ? clientStart(e) : messageScreen('הקישור לא תקין', 'אפשר לבקש שישלחו אותו שוב.');
+  djStart(cleanId(q.get('ev') || ''));
 }
 
 /* ================= DJ side ================= */
 
-function me() {
-  const m = store.get('me');
-  const d = cleanDj(m);
-  return d.n && waPhone(d.p) ? d : null;
-}
-function events() {
-  const e = store.get('events', {});
-  return e && typeof e === 'object' && !Array.isArray(e) ? e : {};
-}
-function saveEvents(all) {
-  if (!store.set('events', all)) toast('לא הצלחתי לשמור במכשיר הזה');
+let EVENTS = [];
+
+async function loadEvents() {
+  try {
+    const { events } = await api('/admin/events', { admin: true });
+    EVENTS = events.map(e => ({ ...e, data: e.data ? cleanBrief(e.data) : null }));
+    store.set('cache', { at: Date.now(), events: EVENTS });
+    return true;
+  } catch (err) {
+    if (err.status === 401) throw err;
+    const c = store.get('cache');
+    if (c?.events) EVENTS = c.events.map(e => ({ ...e, data: e.data ? cleanBrief(e.data) : null }));
+    toast('אין חיבור לאינטרנט. מוצג המידע האחרון שנשמר.');
+    return false;
+  }
 }
 
-function djHome() {
-  document.title = me()?.n || BRAND;
-  if (me()) listScreen();
-  else settingsScreen(true);
+async function djStart(openId) {
+  document.title = CONFIG.dj;
+  if (!store.get('key')) return connectScreen();
+  try {
+    await loadEvents();
+  } catch {
+    store.del('key');
+    return connectScreen('הקוד לא נכון או שהוחלף. צריך להזין את הקוד החדש.');
+  }
+  const e = openId && EVENTS.find(x => x.id === openId);
+  if (openId) history.replaceState(null, '', '/');
+  if (e) eventScreen(e);
+  else listScreen();
 }
 
-function listScreen() {
-  const m = me();
-  const all = Object.values(events()).map(e => ({ e, n: daysUntil(e.ev?.date) }));
-  const upcoming = all.filter(x => x.n == null || x.n >= 0).sort((a, b) => (a.n ?? 1e9) - (b.n ?? 1e9));
-  const past = all.filter(x => x.n != null && x.n < 0).sort((a, b) => b.n - a.n);
-  const group = (title, rows) => rows.length ? [
+function connectScreen(error) {
+  let code = '';
+  const err = h('p', { class: 'small', role: 'alert', style: 'color:var(--bad)' }, error || '');
+  screen(
+    topBar(brand(CONFIG.dj)),
+    h('div', { class: 'hero' }, h('h1', null, 'חיבור הטלפון'),
+      h('p', null, 'פעם אחת בלבד: מדביקים כאן את קוד החיבור, וזהו. מכאן האפליקציה תזכור אותו.')),
+    h('form', {
+      class: 'card stack',
+      onsubmit: async ev => {
+        ev.preventDefault();
+        const c = code.trim().replace(/^.*[#&]k=/, '');
+        if (!c) { err.textContent = 'צריך להדביק את הקוד'; return; }
+        store.set('key', c);
+        try {
+          await api('/admin/check', { admin: true });
+          djStart();
+        } catch (x) {
+          store.del('key');
+          err.textContent = x.status === 401 ? 'הקוד לא נכון' : 'אין חיבור לאינטרנט. כדאי לנסות שוב.';
+        }
+      },
+    },
+    field('קוד החיבור', h('input', { type: 'text', dir: 'ltr', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', oninput: e => { code = e.target.value; } })),
+    err,
+    h('button', { class: 'btn primary block', type: 'submit' }, 'חיבור')),
+  );
+}
+
+// The notifications card on the main screen. Returns null when notifications already work.
+async function pushCard() {
+  const supported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  if (isIOS && !isStandalone()) {
+    return h('div', { class: 'card stack notice' },
+      h('h3', null, 'כדי לקבל התראות על אירועים חדשים'),
+      h('p', { class: 'small' }, 'לוחצים על כפתור השיתוף של ספארי (ריבוע עם חץ), בוחרים "הוספה למסך הבית", ומעכשיו פותחים את DJ MB מהאייקון.'));
+  }
+  if (!supported || !CONFIG.vapid) return null;
+  if (Notification.permission === 'granted') {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      api('/admin/subscribe', { method: 'POST', body: sub.toJSON(), admin: true }).catch(() => {}); // keep the server's copy fresh
+      return null;
+    }
+  }
+  if (Notification.permission === 'denied') {
+    return h('div', { class: 'card notice' }, h('p', { class: 'small' }, 'ההתראות חסומות. אפשר להפעיל אותן בהגדרות הטלפון, תחת התראות, DJ MB.'));
+  }
+  const btn = h('button', { class: 'btn primary block', onclick: () => enablePush(btn) }, 'הפעלת התראות');
+  return h('div', { class: 'card stack notice' },
+    h('h3', null, 'התראה כשלקוח ממלא פרטים'),
+    h('p', { class: 'small' }, 'לחיצה אחת, ומכאן הטלפון יודיע על כל אירוע חדש ועל כל עדכון.'),
+    btn);
+}
+
+async function enablePush(btn) {
+  // The permission prompt must come straight from the tap, before anything else is awaited.
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { toast('ההתראות לא אושרו'); return; }
+  btn.setAttribute('aria-disabled', 'true');
+  btn.textContent = 'מפעיל...';
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = (await reg.pushManager.getSubscription()) ||
+      await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: unb64u(CONFIG.vapid) });
+    await api('/admin/subscribe', { method: 'POST', body: sub.toJSON(), admin: true });
+    await api('/admin/test-push', { method: 'POST', admin: true });
+    toast('ההתראות פועלות. עכשיו אמורה להגיע התראת בדיקה.');
+    listScreen();
+  } catch {
+    toast('לא הצלחתי להפעיל התראות. כדאי לנסות שוב.');
+    btn.removeAttribute('aria-disabled');
+    btn.textContent = 'הפעלת התראות';
+  }
+}
+
+let refreshing = false;
+async function refreshList() {
+  if (refreshing) return;
+  refreshing = true;
+  try { if (await loadEvents()) listScreen(false); } catch { djStart(); } finally { refreshing = false; }
+}
+
+let onList = false;
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && onList) refreshList(); });
+
+function listScreen(scrollTop = true) {
+  const y = window.scrollY;
+  const filled = EVENTS.filter(e => e.submitted && e.data).map(e => ({ e, n: daysUntil(e.data.date) }));
+  const waiting = EVENTS.filter(e => !e.submitted || !e.data);
+  const upcoming = filled.filter(x => x.n == null || x.n >= 0).sort((a, b) => (a.n ?? 1e9) - (b.n ?? 1e9));
+  const past = filled.filter(x => x.n != null && x.n < 0).sort((a, b) => b.n - a.n);
+  const group = (title, rows, card) => rows.length ? [
     h('div', { class: 'section-title' }, h('h2', null, title), h('span', { class: 'muted small' }, String(rows.length))),
-    h('div', { class: 'events' }, rows.map(eventCard)),
+    h('div', { class: 'events' }, rows.map(card)),
   ] : null;
+  const pushSlot = h('div');
 
   screen(
-    topBar(brand(m.n), h('button', { class: 'iconbtn', 'aria-label': 'הגדרות', title: 'הגדרות', onclick: () => settingsScreen() }, '⚙')),
+    topBar(brand(CONFIG.dj), h('button', { class: 'iconbtn', 'aria-label': 'רענון', title: 'רענון', onclick: refreshList }, '⟳')),
+    pushSlot,
     h('div', { class: 'spacer' }),
-    h('button', { class: 'btn primary block', onclick: newEventScreen }, '+ אירוע חדש'),
-    all.length ? null : h('div', { class: 'empty' }, disc(),
+    h('button', { class: 'btn primary block big', onclick: newLinkScreen }, '+ קישור חדש ללקוח'),
+    EVENTS.length ? null : h('div', { class: 'empty' }, disc(),
       h('p', null, 'עוד אין אירועים.'),
-      h('p', { class: 'small' }, 'יוצרים אירוע, שולחים ללקוחות קישור, והפרטים שהם ממלאים חוזרים אלייך לוואטסאפ.')),
-    group('קרובים', upcoming),
-    group('עברו', past),
+      h('p', { class: 'small' }, 'שולחים ללקוח קישור, והאירוע מופיע כאן ברגע שהוא ממלא ומאשר.')),
+    group('קרובים', upcoming, eventCard),
+    group('ממתינים למילוי', waiting, waitingCard),
+    group('עברו', past, eventCard),
   );
+  onList = true;
+  if (!scrollTop) window.scrollTo(0, y);
+  pushCard().then(c => c && pushSlot.replaceChildren(c)).catch(() => {});
 }
 
 function eventCard({ e, n }) {
-  const ev = e.ev || {};
-  return h('button', { class: 'card ev', onclick: () => (e.d ? briefScreen(e) : shareScreen(e)) },
-    h('div', { class: 'date' }, ev.date
-      ? [h('b', null, String(Number(ev.date.slice(8)))), h('span', null, monthShort(ev.date))]
+  const d = e.data;
+  return h('button', { class: 'card ev', onclick: () => eventScreen(e) },
+    h('div', { class: 'date' }, d.date
+      ? [h('b', null, String(Number(d.date.slice(8)))), h('span', null, monthShort(d.date))]
       : h('span', null, 'בלי תאריך')),
     h('div', { class: 'info' },
-      h('b', null, ev.names || 'בלי שם'),
-      h('span', null, [TYPES[ev.type]?.label, whenLabel(n)].filter(Boolean).join(' · '))),
-    h('span', { class: 'badge ' + (e.d ? 'ok' : 'wait') }, e.d ? 'התקבל' : 'ממתין'));
+      h('b', null, d.names || e.label || 'בלי שם'),
+      h('span', null, [d.type ? typeOf(d).label : '', whenLabel(n)].filter(Boolean).join(' · '))),
+    e.updated > (store.get('seen:' + e.id) || 0) ? h('span', { class: 'badge ok' }, 'חדש') : null);
 }
 
-// One-of-many buttons for the event type.
-function typeChips(current, onPick) {
-  return h('div', { class: 'chips', role: 'group', 'aria-label': 'סוג האירוע' }, TYPE_KEYS.map(k =>
-    h('button', {
-      type: 'button', class: 'chip', 'aria-pressed': String(current === k),
-      onclick: e => {
-        for (const b of e.currentTarget.parentNode.children) b.setAttribute('aria-pressed', 'false');
-        e.currentTarget.setAttribute('aria-pressed', 'true');
-        onPick(k);
-      },
-    }, TYPES[k].label)));
+function waitingCard(e) {
+  return h('button', { class: 'card ev', onclick: () => eventScreen(e) },
+    h('div', { class: 'info' },
+      h('b', null, e.label || 'קישור בלי שם'),
+      h('span', null, 'נשלח ' + fmtStamp(e.created))),
+    h('span', { class: 'badge wait' }, 'ממתין'));
 }
 
-function newEventScreen() {
-  const ev = { names: '', type: '', date: '', venue: '' };
-  let phone = '';
-  const set = k => e => { ev[k] = e.target.value; };
-  const err = h('p', { class: 'small', role: 'alert', style: 'color:var(--bad)' });
-  const whoLbl = h('span', { class: 'lbl' }, 'שם האירוע');
-  const whoInput = h('input', { type: 'text', placeholder: 'למשל: נועה ואיתי, או יום ההולדת של דנה', oninput: set('names') });
-  const chips = typeChips('', t => {
-    ev.type = t;
-    [whoLbl.textContent, whoInput.placeholder] = TYPES[t].who;
-    err.textContent = '';
-  });
+function newLinkScreen() {
+  onList = false;
+  let label = '';
+  const btn = h('button', { class: 'btn primary block big', type: 'submit' }, 'יצירת קישור');
   screen(
     topBar(backBtn(listScreen)),
-    h('h1', null, 'אירוע חדש'),
+    h('h1', null, 'קישור חדש ללקוח'),
     h('div', { class: 'spacer' }),
     h('form', {
       class: 'card stack',
-      onsubmit: e => {
-        e.preventDefault();
-        if (!ev.type) {
-          err.textContent = 'צריך לבחור איזה אירוע זה';
-          chips.scrollIntoView({ block: 'center', behavior: 'smooth' });
-          return;
+      onsubmit: async ev => {
+        ev.preventDefault();
+        btn.setAttribute('aria-disabled', 'true');
+        try {
+          const { id } = await api('/admin/events', { method: 'POST', body: { label }, admin: true });
+          const e = { id, label: label.trim(), created: Date.now(), updated: Date.now(), submitted: null, data: null };
+          EVENTS.unshift(e);
+          shareScreen(e);
+        } catch {
+          toast('אין חיבור לאינטרנט. כדאי לנסות שוב.');
+          btn.removeAttribute('aria-disabled');
         }
-        const id = uid();
-        const all = events();
-        all[id] = { id, ev: evOf(cleanBrief(ev)), clientPhone: str(phone, 30), created: Date.now() };
-        saveEvents(all);
-        shareScreen(all[id]);
       },
     },
-    h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'איזה אירוע?'), chips),
-    h('label', { class: 'field' }, whoLbl, whoInput),
-    h('div', { class: 'grid2' },
-      field('תאריך', h('input', { type: 'date', oninput: set('date') })),
-      field('מקום', h('input', { type: 'text', placeholder: 'אולם, גן...', oninput: set('venue') }))),
-    field('הטלפון של הלקוח', h('input', { type: 'tel', dir: 'ltr', placeholder: '050-0000000', autocomplete: 'off', oninput: e => { phone = e.target.value; } }),
-      'לא חובה. אם יש מספר, וואטסאפ ייפתח ישר בצ׳אט הנכון.'),
-    err,
-    h('button', { class: 'btn primary block', type: 'submit' }, 'יצירת קישור ללקוח')),
+    field('למי הקישור?', h('input', { type: 'text', placeholder: 'למשל: דנה, יום הולדת', oninput: e => { label = e.target.value; } }),
+      'לא חובה. רק כדי לזהות ברשימה עד שימלאו.'),
+    btn),
   );
 }
 
-async function shareScreen(e) {
-  const m = me();
-  // If the client already sent details, the new link carries them, so the form opens filled in on any phone.
-  const link = BASE + '#c=' + await pack({ v: 1, dj: m, id: e.id, ev: e.ev, d: e.d || undefined });
-  const to = (TYPES[e.ev.type] || TYPES.other).to;
-  const msg = e.d
-    ? `היי! כאן ${m.n} 🎧\nאם תרצו לעדכן משהו בפרטי האירוע, זה הקישור. אחרי העדכון פשוט שלחו לי שוב:\n${link}`
-    : `היי! כאן ${m.n} 🎧\nכדי שאגיע מוכנה בדיוק ${to} שלכם, אשמח שתמלאו כמה פרטים בקישור. זה לוקח כמה דקות, ממש מהטלפון:\n${link}`;
-  const ev = e.ev;
+function clientLink(id) { return `${location.origin}/?e=${id}`; }
+function clientMessage(id) {
+  return `היי! כאן ${CONFIG.dj} 🎧\nכדי שאגיע מוכנה בדיוק לאירוע שלכם, אשמח שתמלאו כמה פרטים בקישור. זה לוקח כמה דקות, ממש מהטלפון:\n${clientLink(id)}`;
+}
+
+function shareScreen(e) {
+  onList = false;
+  const msg = clientMessage(e.id);
   screen(
-    topBar(backBtn(e.d ? () => briefScreen(e) : listScreen)),
-    h('h1', null, ev.names || 'אירוע'),
-    h('p', { class: 'muted' }, [TYPES[ev.type]?.label, fmtDate(ev.date), ev.venue].filter(Boolean).join(' · ')),
+    topBar(backBtn(() => (e.submitted ? eventScreen(e) : listScreen()))),
+    h('h1', null, 'הקישור מוכן'),
+    e.label ? h('p', { class: 'muted' }, e.label) : null,
     h('div', { class: 'spacer' }),
     h('div', { class: 'card stack' },
-      h('h2', null, e.d ? 'קישור לעדכון הפרטים' : 'הקישור ללקוחות מוכן'),
-      h('p', { class: 'muted' }, 'כשהלקוחות ימלאו וישלחו, הפרטים יגיעו אלייך לוואטסאפ. פותחים את הקישור שמגיע, והאירוע נשמר כאן.'),
-      h('a', { class: 'btn wa block', href: waLink(e.clientPhone, msg), target: '_blank', rel: 'noopener' }, 'שליחה בוואטסאפ'),
-      h('button', { class: 'btn block', onclick: () => copyText(msg, 'ההודעה הועתקה') }, 'העתקת ההודעה'),
-      h('a', { class: 'btn ghost block', href: link, target: '_blank', rel: 'noopener' }, 'איך זה נראה אצל הלקוחות')),
+      h('p', null, 'שולחים ללקוח. ברגע שימלא ויאשר, תגיע התראה והאירוע יופיע ברשימה.'),
+      h('a', { class: 'btn wa block big', href: waLink('', msg), target: '_blank', rel: 'noopener' }, 'שליחה בוואטסאפ'),
+      navigator.share ? h('button', { class: 'btn block', onclick: () => navigator.share({ text: msg }).catch(() => {}) }, 'שליחה בדרך אחרת') : null,
+      h('button', { class: 'btn block', onclick: () => copyText(clientLink(e.id), 'הקישור הועתק') }, 'העתקת הקישור')),
     h('div', { class: 'spacer' }),
-    deleteBtn(e),
+    h('button', { class: 'btn ghost block', onclick: listScreen }, 'סיום'),
+  );
+}
+
+function eventScreen(e) {
+  onList = false;
+  if (!e.submitted || !e.data) {
+    screen(
+      topBar(backBtn(listScreen)),
+      h('h1', null, e.label || 'קישור בלי שם'),
+      h('p', { class: 'muted' }, 'נשלח ' + fmtStamp(e.created) + '. הלקוח עוד לא מילא ואישר.'),
+      h('div', { class: 'spacer' }),
+      h('button', { class: 'btn primary block', onclick: () => shareScreen(e) }, 'שליחת הקישור שוב'),
+      h('div', { class: 'spacer' }),
+      deleteBtn(e),
+    );
+    return;
+  }
+  store.set('seen:' + e.id, e.updated);
+  const d = e.data;
+  document.title = d.names || CONFIG.dj;
+  screen(
+    topBar(backBtn(listScreen), h('button', { class: 'btn small noprint', onclick: () => window.print() }, 'הדפסה')),
+    d.date ? h('a', { class: 'btn primary block noprint', href: `/api/e/${e.id}/ics`, target: '_blank', rel: 'noopener' }, '📅 הוספה ליומן') : null,
+    h('div', { class: 'spacer' }),
+    h('div', { class: 'card' }, briefView(d)),
+    h('div', { class: 'stack noprint', style: 'margin-top:16px' },
+      h('p', { class: 'muted small center' }, 'עודכן לאחרונה ' + fmtStamp(e.submitted)),
+      h('button', { class: 'btn block', onclick: () => shareScreen(e) }, 'שליחת הקישור שוב ללקוח'),
+      deleteBtn(e)),
   );
 }
 
 function deleteBtn(e) {
   return h('button', {
     class: 'btn ghost danger block noprint',
-    onclick: () => {
+    onclick: async () => {
       if (!confirm('למחוק את האירוע הזה?')) return;
-      const all = events();
-      delete all[e.id];
-      saveEvents(all);
-      toast('האירוע נמחק');
-      goHome();
+      try {
+        await api('/admin/events/' + e.id, { method: 'DELETE', admin: true });
+        EVENTS = EVENTS.filter(x => x.id !== e.id);
+        toast('האירוע נמחק');
+        listScreen();
+      } catch {
+        toast('אין חיבור לאינטרנט. כדאי לנסות שוב.');
+      }
     },
   }, 'מחיקת האירוע');
 }
 
-function briefScreen(e, opts = {}) {
-  const m = me();
-  document.title = e.d.names || 'פרטי האירוע';
-  const mine = m && !opts.foreign;
-  screen(
-    topBar(mine ? backBtn(goHome) : brand(e.dj?.n || 'פרטי האירוע'),
-      h('button', { class: 'btn small noprint', onclick: () => window.print() }, 'הדפסה')),
-    opts.note ? h('p', { class: 'card small' }, opts.note) : null,
-    h('div', { class: 'card' }, briefView(e.d)),
-    h('div', { class: 'stack noprint', style: 'margin-top:16px' },
-      e.ts ? h('p', { class: 'muted small center' }, 'התקבל ' + fmtStamp(e.ts)) : null,
-      opts.foreign && !m ? h('div', { class: 'card stack' },
-        h('p', null, `זה הטלפון של ${e.dj.n}? אפשר לשמור כאן את האירוע ולראות את כל האירועים במקום אחד.`),
-        h('button', { class: 'btn primary block', onclick: () => { store.set('me', e.dj); briefFromLink({ id: e.id, d: e.d, ts: e.ts, dj: e.dj }); } }, 'שמירה באירועים שלי')) : null,
-      mine ? h('button', { class: 'btn block', onclick: () => shareScreen(e) }, 'שליחת קישור לעדכון ללקוחות') : null,
-      mine ? deleteBtn(e) : null),
-  );
-}
-
-function briefFromLink(p) {
-  const id = cleanId(p?.id);
-  if (!id || !p.d) return broken(false);
-  const d = cleanBrief(p.d);
-  const e = { id, d, ev: evOf(d), ts: Number(p.ts) || Date.now(), dj: cleanDj(p.dj) };
-  const m = me();
-  if (!m || waPhone(m.p) !== waPhone(e.dj.p)) return briefScreen(e, { foreign: true });
-
-  const all = events();
-  const old = all[id];
-  if (old?.ts && old.ts > e.ts) {
-    return briefScreen(old, { note: 'זה קישור ישן. יש כאן גרסה חדשה יותר של האירוע, והיא זו שמוצגת.' });
-  }
-  all[id] = { ...old, id, ev: e.ev, d, ts: e.ts, created: old?.created || e.ts, clientPhone: old?.clientPhone || d.contactPhone };
-  saveEvents(all);
-  if (old?.ts !== e.ts) toast(old?.d ? 'האירוע עודכן' : 'האירוע נשמר אצלך');
-  briefScreen(all[id]);
-}
-
-function settingsScreen(first = false) {
-  const d = { ...(me() || { n: BRAND, p: '' }) };
-  const err = h('p', { class: 'small', role: 'alert', style: 'color:var(--bad)' });
-  screen(
-    first ? topBar(brand(BRAND)) : topBar(backBtn(listScreen)),
-    first
-      ? h('div', { class: 'hero' }, h('h1', null, 'ברוכה הבאה!'), h('p', null, 'שני פרטים, ואפשר להתחיל לשלוח ללקוחות קישורים למילוי פרטי האירוע.'))
-      : h('h1', null, 'הגדרות'),
-    h('div', { class: 'spacer' }),
-    h('form', {
-      class: 'card stack',
-      onsubmit: e => {
-        e.preventDefault();
-        if (!d.n.trim()) { err.textContent = 'צריך למלא שם'; return; }
-        if (!waPhone(d.p)) { err.textContent = 'מספר הוואטסאפ לא נראה תקין'; return; }
-        if (!store.set('me', cleanDj(d))) { err.textContent = 'הדפדפן לא מאפשר לשמור. אולי זה מצב גלישה בסתר?'; return; }
-        if (!first) toast('נשמר');
-        listScreen();
-      },
-    },
-    field('השם שלך, כפי שיופיע ללקוחות', h('input', { type: 'text', value: d.n, placeholder: 'למשל: ' + BRAND, autocomplete: 'name', oninput: e => { d.n = e.target.value; } })),
-    field('מספר הוואטסאפ שלך', h('input', { type: 'tel', dir: 'ltr', value: d.p, placeholder: '050-0000000', autocomplete: 'tel', oninput: e => { d.p = e.target.value; } }),
-      'לכאן יגיעו הפרטים שהלקוחות ממלאים'),
-    err,
-    h('button', { class: 'btn primary block', type: 'submit' }, first ? 'שמירה והמשך' : 'שמירה')),
-    h('div', { class: 'card stack', style: 'margin-top:16px' },
-      h('h3', null, first ? 'עברת לטלפון חדש?' : 'גיבוי'),
-      h('p', { class: 'muted small' }, first
-        ? 'אם יש לך קובץ גיבוי, אפשר לשחזר ממנו את כל האירועים.'
-        : 'האירועים נשמרים בדפדפן של המכשיר הזה. כדאי להוסיף את האתר למסך הבית ולהוריד גיבוי מדי פעם. וגם אם משהו הולך לאיבוד, כל אירוע נמצא בקישור ששלחו לך בוואטסאפ.'),
-      h('div', { class: 'row' },
-        first ? null : h('button', { class: 'btn grow', onclick: downloadBackup }, 'הורדת גיבוי'),
-        h('label', { class: 'btn grow' }, 'שחזור מגיבוי',
-          h('input', { type: 'file', accept: 'application/json,.json', hidden: true, onchange: restoreBackup })))),
-  );
-}
-
-function downloadBackup() {
-  const data = { app: 'dj-planner', v: 1, at: Date.now(), me: me(), events: events() };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
-  const a = h('a', { href: url, download: `events-backup-${new Date().toISOString().slice(0, 10)}.json` });
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
-}
-
-async function restoreBackup(e) {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  try {
-    const j = JSON.parse(await file.text());
-    if (j?.app !== 'dj-planner' || !j.events || typeof j.events !== 'object') throw new Error('not a backup');
-    const all = events();
-    let n = 0;
-    for (const [id, x] of Object.entries(j.events)) {
-      if (!cleanId(id) || !x || typeof x !== 'object') continue;
-      const item = { id, ev: evOf(cleanBrief(x.ev)), clientPhone: str(x.clientPhone, 30), created: Number(x.created) || 0 };
-      if (x.d) { item.d = cleanBrief(x.d); item.ts = Number(x.ts) || 0; item.ev = evOf(item.d); }
-      const old = all[id];
-      if (!old || (item.ts || item.created) >= (old.ts || old.created || 0)) { all[id] = item; n++; }
-    }
-    if (!me() && j.me) store.set('me', cleanDj(j.me));
-    saveEvents(all);
-    toast(`שוחזרו ${n} אירועים`);
-    djHome();
-  } catch {
-    toast('הקובץ הזה לא נראה כמו גיבוי של האפליקציה');
-  }
-}
-
-/* ================= the run sheet (shared by DJ and client summary) ================= */
+/* ================= the event sheet (DJ's view and the client's summary) ================= */
 
 function briefView(d) {
   const n = daysUntil(d.date);
@@ -397,7 +408,7 @@ function briefView(d) {
 
   const parts = [
     h('div', { class: 'bhead' },
-      h('div', { class: 'type' }, TYPES[d.type]?.label),
+      d.type ? h('div', { class: 'type' }, typeOf(d).label) : null,
       h('h1', null, d.names || 'בלי שם'),
       n != null ? h('span', { class: 'when' }, whenLabel(n)) : null,
       h('div', { class: 'meta' },
@@ -433,36 +444,37 @@ function briefView(d) {
       playlist ? h('p', { style: 'margin-top:8px' }, h('a', { href: playlist, target: '_blank', rel: 'noopener' }, 'פתיחת הפלייליסט'), ' ', h('span', { class: 'muted small ltr' }, new URL(playlist).hostname)) : null));
   }
   if (d.notes) parts.push(section('הערות', h('p', { class: 'prewrap' }, d.notes)));
-  if (parts.length === 1 && !d.date && !place) parts.push(h('p', { class: 'muted', style: 'margin-top:12px' }, 'עוד לא מולאו פרטים.'));
   return h('article', { class: 'brief' }, parts);
 }
 
 /* ================= client side ================= */
 
-let C = null; // { id, dj, d, step, sent }
-const STEPS = ['פרטים', 'אווירה', 'רגעים', 'שירים', 'לו״ז', 'שליחה'];
+let C = null; // { id, d, step, submitted }
+const STEPS = ['פרטים', 'אווירה', 'רגעים', 'שירים', 'לו״ז', 'אישור'];
 
-function clientStart(p) {
-  const id = cleanId(p?.id);
-  const dj = cleanDj(p?.dj);
-  if (!id || !dj.n) return broken(false);
+async function clientStart(id) {
+  document.title = `פרטי האירוע · ${CONFIG.dj}`;
+  let res;
+  try {
+    res = await api('/e/' + id);
+  } catch (err) {
+    if (err.status === 404) return messageScreen('הקישור לא נמצא', `ייתכן שהקישור הועתק חלקית. אפשר לבקש ${withL(CONFIG.dj)} לשלוח אותו שוב.`);
+    return messageScreen('אין חיבור', 'צריך חיבור לאינטרנט כדי למלא את הפרטים.', h('button', { class: 'btn primary block', onclick: () => clientStart(id) }, 'לנסות שוב'));
+  }
   const draft = store.get('draft:' + id);
-  const d = draft?.d ? cleanBrief(draft.d) : p.d ? cleanBrief(p.d) : newBrief(p.ev);
-  const step = Math.min(Math.max(Number(draft?.step) || 0, 0), STEPS.length - 1);
-  C = { id, dj, d, step, sent: !!draft?.sent };
-  document.title = `פרטי האירוע · ${dj.n}`;
+  const useDraft = draft?.d && (!res.submitted || (draft.at || 0) > res.submitted);
+  const d = useDraft ? cleanBrief(draft.d) : res.data ? cleanBrief(res.data) : newBrief({ names: '' });
+  const step = useDraft ? Math.min(Math.max(Number(draft.step) || 0, 0), STEPS.length - 1) : 0;
+  C = { id, d, step, submitted: res.submitted };
   renderClient();
 }
 
 let draftTimer;
-function saveDraft() {
-  clearTimeout(draftTimer);
-  draftTimer = setTimeout(saveDraftNow, 400);
-}
+function saveDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(saveDraftNow, 400); }
 function saveDraftNow() {
   clearTimeout(draftTimer);
   if (!C) return;
-  const ok = store.set('draft:' + C.id, { d: C.d, step: C.step, sent: C.sent, at: Date.now() });
+  const ok = store.set('draft:' + C.id, { d: C.d, step: C.step, at: Date.now() });
   const el = document.getElementById('savestate');
   if (el) el.textContent = ok ? 'נשמר בטלפון ✓' : '';
 }
@@ -470,6 +482,11 @@ addEventListener('pagehide', saveDraftNow);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveDraftNow(); });
 
 function go(i) {
+  if (C.step === 0 && i > 0 && !C.d.type) {
+    toast('צריך לבחור איזה אירוע זה');
+    document.querySelector('.chips')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    return;
+  }
   if (C.step === 4) C.d.timeline = sortTimeline(C.d.timeline);
   C.step = i;
   saveDraftNow();
@@ -478,21 +495,20 @@ function go(i) {
 
 function renderClient() {
   const s = C.step;
-  const body = [stepDetails, stepVibe, stepMoments, stepSongs, stepTimeline, stepSend][s]();
+  const body = [stepDetails, stepVibe, stepMoments, stepSongs, stepTimeline, stepConfirm][s]();
   app.replaceChildren(
     h('div', { class: 'wrap' },
-      topBar(brand(C.dj.n), h('span', { class: 'savestate', id: 'savestate' })),
+      topBar(brand(CONFIG.dj), h('span', { class: 'savestate', id: 'savestate' })),
       s === 0 ? h('div', { class: 'hero' },
-        h('p', { class: 'small', style: 'margin:0 0 6px' }, [TYPES[C.d.type]?.label, C.d.names].filter(Boolean).join(' · ')),
         h('h1', null, 'היי!'),
-        h('p', null, `כמה דקות של מילוי, ואני מגיעה מוכנה בדיוק ${(TYPES[C.d.type] || TYPES.other).to} שלכם. הכול נשמר אוטומטית בטלפון, אפשר לעצור ולהמשיך מתי שנוח.`)) : null,
+        h('p', null, 'כמה דקות של מילוי, ואני מגיעה מוכנה בדיוק לאירוע שלכם. הכול נשמר אוטומטית בטלפון, אפשר לעצור ולהמשיך מתי שנוח.')) : null,
       h('nav', { class: 'steps', 'aria-label': 'שלבים' }, STEPS.map((nm, i) =>
         h('button', { class: i === s ? 'on' : i < s ? 'done' : '', 'aria-label': `שלב ${i + 1}: ${nm}`, 'aria-current': i === s ? 'step' : null, onclick: () => go(i) },
           h('span', { class: 'bar' }), h('span', { class: 'nm' }, nm)))),
       body),
-    h('nav', { class: 'bottom' }, h('div', { class: 'in' },
+    s < STEPS.length - 1 ? h('nav', { class: 'bottom' }, h('div', { class: 'in' },
       s > 0 ? h('button', { class: 'btn', onclick: () => go(s - 1) }, 'הקודם') : null,
-      s < STEPS.length - 1 ? h('button', { class: 'btn primary', onclick: () => go(s + 1) }, s === STEPS.length - 2 ? 'לסיכום ושליחה' : 'הבא') : null)),
+      h('button', { class: 'btn primary', onclick: () => go(s + 1) }, s === STEPS.length - 2 ? 'לסיכום ואישור' : 'הבא'))) : null,
   );
   window.scrollTo(0, 0);
 }
@@ -504,17 +520,23 @@ function bind(obj, key, attrs = {}, tag = 'input') {
 
 function stepDetails() {
   const d = C.d;
-  const whoLbl = h('span', { class: 'lbl' }, TYPES[d.type].who[0]);
-  const whoInput = bind(d, 'names', { placeholder: TYPES[d.type].who[1] });
-  const changeType = t => {
-    const old = d.type;
-    d.type = t;
-    // Swap in the new type's moments and timeline, unless the client already changed them.
-    if (isDefaultList(d.moments, old, 'moments')) d.moments = defaultsFor(t).moments;
-    if (isDefaultList(d.timeline, old, 'timeline')) d.timeline = defaultsFor(t).timeline;
-    [whoLbl.textContent, whoInput.placeholder] = TYPES[t].who;
-    saveDraft();
-  };
+  const whoLbl = h('span', { class: 'lbl' }, d.type ? typeOf(d).who[0] : 'שם האירוע או בעלי השמחה');
+  const whoInput = bind(d, 'names', { placeholder: d.type ? typeOf(d).who[1] : 'למשל: נועה ואיתי' });
+  const typeChips = h('div', { class: 'chips', role: 'group', 'aria-label': 'סוג האירוע' }, TYPE_KEYS.map(k =>
+    h('button', {
+      type: 'button', class: 'chip', 'aria-pressed': String(d.type === k),
+      onclick: e => {
+        const old = d.type;
+        d.type = k;
+        // Swap in the new type's moments and timeline, unless the client already changed them.
+        if (isDefaultList(d.moments, old, 'moments')) d.moments = defaultsFor(k).moments;
+        if (isDefaultList(d.timeline, old, 'timeline')) d.timeline = defaultsFor(k).timeline;
+        [whoLbl.textContent, whoInput.placeholder] = TYPES[k].who;
+        for (const b of e.currentTarget.parentNode.children) b.setAttribute('aria-pressed', 'false');
+        e.currentTarget.setAttribute('aria-pressed', 'true');
+        saveDraft();
+      },
+    }, TYPES[k].label)));
   const ageChips = h('div', { class: 'chips', role: 'group', 'aria-label': 'גילאי הקהל' }, Object.entries(AGES).map(([k, label]) =>
     h('button', {
       type: 'button', class: 'chip', 'aria-pressed': String(d.ages === k),
@@ -526,7 +548,7 @@ function stepDetails() {
       },
     }, label)));
   return h('div', { class: 'stack' },
-    field('סוג האירוע', h('select', { value: d.type, oninput: e => changeType(e.target.value) }, TYPE_KEYS.map(k => h('option', { value: k }, TYPES[k].label)))),
+    h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'איזה אירוע?'), typeChips),
     h('label', { class: 'field' }, whoLbl, whoInput),
     field('תאריך', bind(d, 'date', { type: 'date' })),
     h('div', { class: 'grid2' }, field('שעת התחלה', bind(d, 'start', { type: 'time' })), field('שעת סיום', bind(d, 'end', { type: 'time' }))),
@@ -707,40 +729,52 @@ function stepTimeline() {
   );
 }
 
-function stepSend() {
+function stepConfirm() {
   const d = C.d;
-  let msg = '';
-  const waBtn = h('a', { class: 'btn wa block', 'aria-disabled': 'true', target: '_blank', rel: 'noopener' }, `שליחה ${withL(C.dj.n)} בוואטסאפ`);
-  waBtn.addEventListener('click', () => {
-    C.sent = true;
-    saveDraftNow();
-    setTimeout(() => toast('תודה! אם משהו משתנה, אפשר לעדכן כאן ולשלוח שוב.'), 800);
-  });
-  const shareBtn = navigator.share ? h('button', { class: 'btn block', onclick: () => msg && navigator.share({ text: msg }).catch(() => {}) }, 'שליחה בדרך אחרת') : null;
-  const copyBtn = h('button', { class: 'btn block', onclick: () => msg && copyText(msg, 'ההודעה הועתקה') }, 'העתקת ההודעה');
-
-  // Build the link before any tap, so the WhatsApp button opens straight away (phones block pop-ups opened late).
-  pack({ v: 1, dj: C.dj, id: C.id, ts: Date.now(), d }).then(packed => {
-    const link = BASE + '#b=' + packed;
-    msg = `היי ${C.dj.n}, מילאנו את פרטי האירוע 🎶\n${[TYPES[d.type].label, d.names, fmtDate(d.date)].filter(Boolean).join(' · ')}\n\nכל הפרטים בקישור:\n${link}`;
-    waBtn.href = waLink(C.dj.p, msg);
-    waBtn.removeAttribute('aria-disabled');
-  });
-
-  const missing = [!d.names && 'שמות', !d.date && 'תאריך'].filter(Boolean);
+  const missing = [!d.type && 'סוג האירוע', !d.date && 'תאריך'].filter(Boolean);
+  const btn = h('button', {
+    class: 'btn primary block big',
+    'aria-disabled': missing.length ? 'true' : null,
+    onclick: async () => {
+      btn.setAttribute('aria-disabled', 'true');
+      btn.textContent = 'שולח...';
+      try {
+        await api('/e/' + C.id, { method: 'PUT', body: { data: d } });
+        C.submitted = Date.now();
+        store.set('draft:' + C.id, { d, step: C.step, at: C.submitted });
+        thanksScreen();
+      } catch {
+        toast('לא הצלחנו לשלוח. כדאי לבדוק את החיבור לאינטרנט ולנסות שוב.');
+        btn.removeAttribute('aria-disabled');
+        btn.textContent = `אישור ושליחה ${withL(CONFIG.dj)}`;
+      }
+    },
+  }, `אישור ושליחה ${withL(CONFIG.dj)}`);
   return h('div', { class: 'stack' },
-    h('div', null, h('h2', null, 'הכול מוכן?'),
-      h('p', { class: 'muted' }, 'שולחים לי בוואטסאפ בלחיצה. אפשר לחזור ולעדכן מתי שרוצים, ופשוט לשלוח שוב.')),
-    missing.length ? h('p', { class: 'card small' }, `חסר: ${missing.join(' ו')}. אפשר לשלוח גם ככה, אבל עדיף להשלים. `,
-      h('a', { href: '#', onclick: e => { e.preventDefault(); go(0); } }, 'להשלמה')) : null,
-    waBtn, shareBtn, copyBtn,
-    C.sent ? h('p', { class: 'muted small center' }, 'כבר שלחתם פעם אחת. שינויים חדשים יגיעו אליי רק אם תשלחו שוב.') : null,
+    h('div', null, h('h2', null, 'הכול נכון?'),
+      h('p', { class: 'muted' }, C.submitted
+        ? 'כבר שלחתם את הפרטים. אם שיניתם משהו, מאשרים שוב והעדכון יגיע אליי.'
+        : 'בודקים שהכול נכון ומאשרים. אפשר לחזור לקישור ולעדכן גם אחר כך.')),
+    missing.length ? h('p', { class: 'card small' }, `כדי לשלוח חסר: ${missing.join(' ו')}. `,
+      h('a', { href: '#', onclick: e => { e.preventDefault(); C.step = 0; renderClient(); } }, 'להשלמה')) : null,
+    btn,
     h('div', { class: 'section-title' }, h('h2', null, 'ככה זה יגיע אליי')),
     h('div', { class: 'card' }, briefView(d)),
+    h('button', { class: 'btn block', onclick: () => go(C.step - 1) }, 'הקודם'),
   );
 }
 
-/* ================= start ================= */
+function thanksScreen() {
+  screen(
+    topBar(brand(CONFIG.dj)),
+    h('div', { class: 'hero center' },
+      h('div', { style: 'font-size:56px;line-height:1' }, '🎉'),
+      h('h1', { style: 'margin-top:12px' }, 'תודה!'),
+      h('p', null, `הפרטים נשלחו ${withL(CONFIG.dj)}.`),
+      h('p', null, 'אם משהו משתנה, פשוט פותחים שוב את אותו קישור, מעדכנים ומאשרים.')),
+    h('div', { class: 'spacer' }),
+    h('button', { class: 'btn block', onclick: () => { C.step = 0; renderClient(); } }, 'חזרה לפרטים'),
+  );
+}
 
-addEventListener('hashchange', route);
-route();
+start();

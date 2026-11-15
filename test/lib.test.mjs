@@ -1,37 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  pack, unpack, CutLinkError, cleanBrief, cleanDj, cleanId, cleanSong, newBrief, defaultsFor, isDefaultList,
+  cleanBrief, buildIcs, eventLine, cleanDj, cleanId, cleanSong, newBrief, defaultsFor, isDefaultList,
   sortTimeline, daysUntil, whenLabel, fmtDate, hebDate, gematria, waPhone, okUrl, uid, TYPE_KEYS, TYPES,
-} from '../lib.js';
-
-test('pack and unpack round-trip Hebrew data and stay link-safe', async () => {
-  const obj = { names: 'נועה ואיתי', must: [{ t: 'שיר', a: 'עומר אדם' }], n: 42, emoji: '🎶' };
-  const s = await pack(obj);
-  assert.match(s, /^[zj][A-Za-z0-9_-]*E$/);
-  assert.deepEqual(await unpack(s), obj);
-});
-
-test('a full brief packs into a link that fits in a chat message', async () => {
-  const d = newBrief({ names: 'נועה ואיתי', type: 'wedding', date: '2027-06-10' });
-  for (let i = 0; i < 40; i++) d.must.push({ t: `שיר מספר ${i}`, a: 'אמן כלשהו' });
-  d.notes = 'הערות '.repeat(100);
-  const s = await pack({ v: 1, id: 'abc123', d });
-  assert.ok(s.length < 4000, `packed length ${s.length}`);
-  assert.deepEqual((await unpack(s)).d, d);
-});
-
-test('unpack reports a link that was cut short', async () => {
-  const s = await pack({ a: 'x'.repeat(200) });
-  await assert.rejects(unpack(s.slice(0, -5)), CutLinkError);
-  await assert.rejects(unpack(''), CutLinkError);
-});
-
-test('unpack rejects garbage', async () => {
-  await assert.rejects(unpack('q123E'));
-  await assert.rejects(unpack('z!!!E'));
-  await assert.rejects(unpack('zAAAAE'));
-});
+} from '../public/lib.js';
 
 test('cleanBrief fills missing fields and drops wrong types', () => {
   const d = cleanBrief({
@@ -66,7 +38,7 @@ test('cleanBrief caps long strings and long lists', () => {
 test('cleanDj, cleanId and cleanSong', () => {
   assert.deepEqual(cleanDj({ n: ' DJ מיכל ', p: '050-1234567' }), { n: 'DJ מיכל', p: '050-1234567' });
   assert.deepEqual(cleanDj('x'), { n: '', p: '' });
-  assert.equal(cleanId('ab12cd'), 'ab12cd');
+  assert.equal(cleanId('ab12cd34'), 'ab12cd34');
   assert.equal(cleanId('AB12'), '');
   assert.equal(cleanId('../x'), '');
   assert.equal(cleanSong(''), null);
@@ -84,7 +56,9 @@ test('every event type has defaults, and switching types only replaces untouched
   assert.ok(isDefaultList(d.moments, 'wedding', 'moments'));
   d.moments[0].song = { t: 'שיר', a: '' };
   assert.equal(isDefaultList(d.moments, 'wedding', 'moments'), false);
-  assert.equal(newBrief({}).type, 'other');
+  assert.equal(newBrief({}).type, '');
+  assert.equal(cleanBrief({ type: '' }).type, '');
+  assert.equal(cleanBrief({}).type, 'other');
 });
 
 test('every event type has its wording and ends with a closing song', () => {
@@ -155,4 +129,37 @@ test('okUrl only allows web links', () => {
 
 test('uid makes ids that pass cleanId', () => {
   for (let i = 0; i < 50; i++) assert.equal(cleanId(uid()) !== '', true);
+});
+
+test('uid is long and random enough to act as a key', () => {
+  const ids = new Set(Array.from({ length: 200 }, uid));
+  assert.equal(ids.size, 200);
+  for (const id of ids) assert.match(id, /^[a-z0-9]{20}$/);
+});
+
+test('eventLine sums up an event', () => {
+  assert.match(eventLine(cleanBrief({ type: 'birthday', names: 'דנה, 40', date: '2027-02-20' })), /^יום הולדת · דנה, 40 · .*20/);
+  assert.equal(eventLine(cleanBrief({ type: '', names: '' }), 'משפחת לוי'), 'משפחת לוי');
+});
+
+test('calendar file: timed event that ends after midnight', () => {
+  const d = cleanBrief({ type: 'wedding', names: 'נועה ואיתי', date: '2027-06-10', start: '19:30', end: '01:00', venue: 'גני הדר', city: 'ראשון לציון',
+    contactName: 'רונית', contactPhone: '054-1112233', timeline: [{ time: '20:30', what: 'חופה' }, { time: '19:30', what: 'קבלת פנים' }] });
+  const ics = buildIcs(d, { uid: 'abc123', url: 'https://x.dev/?ev=abc123', dj: 'DJ MB', stamp: new Date(Date.UTC(2026, 10, 15, 8)) });
+  const unfolded = ics.replace(/\r\n /g, '');
+  assert.ok(ics.endsWith('\r\n'));
+  assert.match(unfolded, /DTSTART;TZID=Asia\/Jerusalem:20270610T193000\r\n/);
+  assert.match(unfolded, /DTEND;TZID=Asia\/Jerusalem:20270611T010000\r\n/);
+  assert.match(unfolded, /SUMMARY:DJ MB · חתונה · נועה ואיתי\r\n/);
+  assert.ok(unfolded.includes('LOCATION:גני הדר\\, ראשון לציון\r\n'));
+  assert.ok(unfolded.includes('19:30 קבלת פנים\\n20:30 חופה'));
+  assert.match(unfolded, /UID:abc123@dj-mb/);
+  assert.match(unfolded, /TRIGGER:-P1D/);
+  for (const line of ics.split('\r\n')) assert.ok(new TextEncoder().encode(line).length <= 75, line);
+});
+
+test('calendar file: all-day when there is no start time, nothing without a date', () => {
+  const ics = buildIcs(cleanBrief({ type: 'brit', date: '2027-12-31' }), { uid: 'x' });
+  assert.match(ics, /DTSTART;VALUE=DATE:20271231\r\nDTEND;VALUE=DATE:20280101/);
+  assert.equal(buildIcs(cleanBrief({ names: 'x' }), { uid: 'x' }), '');
 });
