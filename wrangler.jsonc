@@ -3,6 +3,8 @@
   "name": "dj-mb",
   "main": "worker/index.js",
   "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+  "preview_urls": false,
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
@@ -12,8 +14,7 @@
     {
       "binding": "DB",
       "database_name": "dj-mb",
-      // Filled in at setup by `npx wrangler d1 create dj-mb` (see SETUP.md)
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "ce4cffe2-efc7-46df-abb2-4d3afffec014",
       "migrations_dir": "migrations"
     }
   ],
